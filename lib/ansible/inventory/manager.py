@@ -96,8 +96,10 @@ def split_host_pattern(pattern):
     Takes a string containing host patterns separated by commas (or a list
     thereof) and returns a list of single patterns (which may not contain
     commas). Whitespace is ignored.
+
     Also accepts ':' as a separator for backwards compatibility, but it is
     not recommended due to the conflict with IPv6 addresses and host ranges.
+
     Example: 'a,b[1], c[2:3] , d' -> ['a', 'b[1]', 'c[2:3]', 'd']
     """
 
@@ -262,62 +264,68 @@ class InventoryManager(object):
                     parsed = parsed_this_one
         else:
             # left with strings or files, let plugins figure it out
-
-            # set so new hosts can use for inventory_file/dir vars
-            self._inventory.current_source = source
-
-            # try source with each plugin
-            failures = []
-            for plugin in self._fetch_inventory_plugins():
-
-                plugin_name = to_text(getattr(plugin, '_load_name', getattr(plugin, '_original_path', '')))
-                display.debug(u'Attempting to use plugin %s (%s)' % (plugin_name, plugin._original_path))
-
-                # initialize and figure out if plugin wants to attempt parsing this file
-                try:
-                    plugin_wants = bool(plugin.verify_file(source))
-                except Exception:
-                    plugin_wants = False
-
-                if plugin_wants:
-                    try:
-                        # FIXME in case plugin fails 1/2 way we have partial inventory
-                        plugin.parse(self._inventory, self._loader, source, cache=cache)
-                        try:
-                            plugin.update_cache_if_changed()
-                        except AttributeError:
-                            # some plugins might not implement caching
-                            pass
-                        parsed = True
-                        display.vvv('Parsed %s inventory source with %s plugin' % (source, plugin_name))
-                        break
-                    except AnsibleParserError as e:
-                        display.debug('%s was not parsable by %s' % (source, plugin_name))
-                        tb = ''.join(traceback.format_tb(sys.exc_info()[2]))
-                        failures.append({'src': source, 'plugin': plugin_name, 'exc': e, 'tb': tb})
-                    except Exception as e:
-                        display.debug('%s failed while attempting to parse %s' % (plugin_name, source))
-                        tb = ''.join(traceback.format_tb(sys.exc_info()[2]))
-                        failures.append({'src': source, 'plugin': plugin_name, 'exc': AnsibleError(e), 'tb': tb})
-                else:
-                    display.vvv("%s declined parsing %s as it did not pass its verify_file() method" % (plugin_name, source))
-            else:
-                if not parsed and failures:
-                    # only if no plugin processed files should we show errors.
-                    for fail in failures:
-                        display.warning(u'\n* Failed to parse %s with %s plugin: %s' % (to_text(fail['src']), fail['plugin'], to_text(fail['exc'])))
-                        if 'tb' in fail:
-                            display.vvv(to_text(fail['tb']))
-                    if C.INVENTORY_ANY_UNPARSED_IS_FAILED:
-                        raise AnsibleError(u'Completely failed to parse inventory source %s' % (source))
-        if not parsed:
-            if source != '/etc/ansible/hosts' or os.path.exists(source):
-                # only warn if NOT using the default and if using it, only if the file is present
-                display.warning("Unable to parse %s as an inventory source" % source)
+            parsed = self.plugins_parse_source(source, cache=cache)
+            
+        if not parsed and (source != '/etc/ansible/hosts' or os.path.exists(source)):
+            # only warn if NOT using the default and if using it, only if the file is present
+            display.warning("Unable to parse %s as an inventory source" % source)
 
         # clear up, jic
         self._inventory.current_source = None
 
+        return parsed
+
+    def plugins_parse_source(self, source, cache=False):
+        ''' Use plugins to parse a source '''
+
+        # set so new hosts can use for inventory_file/dir vars
+        self._inventory.current_source = source
+        parsed = False
+
+        # try source with each plugin
+        failures = []
+        for plugin in self._fetch_inventory_plugins():
+
+            plugin_name = to_text(getattr(plugin, '_load_name', getattr(plugin, '_original_path', '')))
+            display.debug(u'Attempting to use plugin %s (%s)' % (plugin_name, plugin._original_path))
+
+            # initialize and figure out if plugin wants to attempt parsing this file
+            try:
+                plugin_wants = bool(plugin.verify_file(source))
+            except Exception:
+                plugin_wants = False
+
+            if plugin_wants:
+                try:
+                    # FIXME in case plugin fails 1/2 way we have partial inventory
+                    plugin.parse(self._inventory, self._loader, source, cache=cache)
+                    try:
+                        plugin.update_cache_if_changed()
+                    except AttributeError:
+                        # some plugins might not implement caching
+                        pass
+                    parsed = True
+                    display.vvv('Parsed %s inventory source with %s plugin' % (source, plugin_name))
+                    break
+                except AnsibleParserError as e:
+                    display.debug('%s was not parsable by %s' % (source, plugin_name))
+                    tb = ''.join(traceback.format_tb(sys.exc_info()[2]))
+                    failures.append({'src': source, 'plugin': plugin_name, 'exc': e, 'tb': tb})
+                except Exception as e:
+                    display.debug('%s failed while attempting to parse %s' % (plugin_name, source))
+                    tb = ''.join(traceback.format_tb(sys.exc_info()[2]))
+                    failures.append({'src': source, 'plugin': plugin_name, 'exc': AnsibleError(e), 'tb': tb})
+            else:
+                display.vvv("%s declined parsing %s as it did not pass its verify_file() method" % (plugin_name, source))
+        else:
+            if not parsed and failures:
+                # only if no plugin processed files should we show errors.
+                for fail in failures:
+                    display.warning(u'\n* Failed to parse %s with %s plugin: %s' % (to_text(fail['src']), fail['plugin'], to_text(fail['exc'])))
+                    if 'tb' in fail:
+                        display.vvv(to_text(fail['tb']))
+                if C.INVENTORY_ANY_UNPARSED_IS_FAILED:
+                    raise AnsibleError(u'Completely failed to parse inventory source %s' % (source))
         return parsed
 
     def clear_caches(self):
@@ -437,29 +445,37 @@ class InventoryManager(object):
         """
         Takes a single pattern and returns a list of matching host names.
         Ignores intersection (&) and exclusion (!) specifiers.
+
         The pattern may be:
+
             1. A regex starting with ~, e.g. '~[abc]*'
             2. A shell glob pattern with ?/*/[chars]/[!chars], e.g. 'foo*'
             3. An ordinary word that matches itself only, e.g. 'foo'
+
         The pattern is matched using the following rules:
+
             1. If it's 'all', it matches all hosts in all groups.
             2. Otherwise, for each known group name:
                 (a) if it matches the group name, the results include all hosts
                     in the group or any of its children.
                 (b) otherwise, if it matches any hosts in the group, the results
                     include the matching hosts.
+
         This means that 'foo*' may match one or more groups (thus including all
         hosts therein) but also hosts in other groups.
+
         The built-in groups 'all' and 'ungrouped' are special. No pattern can
         match these group names (though 'all' behaves as though it matches, as
         described above). The word 'ungrouped' can match a host of that name,
         and patterns like 'ungr*' and 'al*' can match either hosts or groups
         other than all and ungrouped.
+
         If the pattern matches one or more group names according to these rules,
         it may have an optional range suffix to select a subset of the results.
         This is allowed only if the pattern is not a regex, i.e. '~foo[1]' does
         not work (the [1] is interpreted as part of the regex), but 'foo*[1]'
         would work if 'foo*' matched the name of one or more groups.
+
         Duplicate matches are always eliminated from the results.
         """
 
@@ -482,6 +498,7 @@ class InventoryManager(object):
         Takes a pattern, checks if it has a subscript, and returns the pattern
         without the subscript and a (start,end) tuple representing the given
         subscript (or None if there is no subscript).
+
         Validates that the subscript is in the right syntax, but doesn't make
         sure the actual indices make sense in context.
         """
